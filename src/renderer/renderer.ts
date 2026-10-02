@@ -61,8 +61,93 @@ try {
 }
 const haveGstAudio = GstAudio !== null;
 
+let WebKit: any = null;
+try {
+    // WebKitGTK 6.0 (GTK4) is optional; only needed for web wallpapers
+    // @ts-expect-error -- no @girs/webkit-6.0 types; WebKit is used untyped
+    WebKit = ((await import('gi://WebKit?version=6.0')) as any).default;
+} catch (e) {
+    console.warn('WebKit 6.0, or the typelib is not installed. Web wallpapers are disabled.');
+}
+const haveWebKit = WebKit !== null;
+
 // Use glsinkbin for Gst 1.24+
 const useGstGL = isGstVersionAtLeast(1, 24);
+
+interface WebWallpaper {
+    uri: string;
+    // Wallpaper Engine style user properties: {key: {value}}
+    properties: Record<string, {value: unknown}>;
+}
+
+// Wraps requestAnimationFrame so the page can be paused from the renderer.
+const WEB_PAUSE_SCRIPT = `(() => {
+    const raf = window.requestAnimationFrame.bind(window);
+    let paused = false;
+    let queue = [];
+    window.requestAnimationFrame = cb => {
+        if (!paused)
+            return raf(cb);
+        queue.push(cb);
+        return 0;
+    };
+    window.__hanabiSetPaused = p => {
+        paused = p;
+        if (!paused) {
+            const pending = queue;
+            queue = [];
+            pending.forEach(cb => raf(cb));
+        }
+    };
+})();`;
+
+/**
+ * Resolves a wallpaper path to a web wallpaper, or null when it is a video.
+ * Accepts an .html file, or a Wallpaper Engine folder with project.json of type "web".
+ */
+function resolveWebWallpaper(path: string): WebWallpaper | null {
+    if (!path)
+        return null;
+
+    const file = Gio.File.new_for_path(path);
+    const fileType = file.query_file_type(Gio.FileQueryInfoFlags.NONE, null);
+    let dir: Gio.File | null = null;
+    let htmlFile: Gio.File | null = null;
+
+    if (fileType === Gio.FileType.DIRECTORY) {
+        dir = file;
+    } else if (/\.html?$/i.test(path)) {
+        dir = file.get_parent();
+        htmlFile = file;
+    } else if (file.get_basename() === 'project.json') {
+        dir = file.get_parent();
+    } else {
+        return null;
+    }
+
+    let properties: Record<string, {value: unknown}> = {};
+    const projectFile = dir?.get_child('project.json');
+    if (projectFile?.query_exists(null)) {
+        try {
+            const [, bytes] = projectFile.load_contents(null);
+            const project = JSON.parse(new TextDecoder().decode(bytes));
+            if (project.type && String(project.type).toLowerCase() !== 'web')
+                return null;
+            if (!htmlFile && project.file)
+                htmlFile = dir!.get_child(project.file);
+            for (const [key, prop] of Object.entries<any>(project.general?.properties ?? {}))
+                properties[key] = {value: prop.value};
+        } catch (e) {
+            console.warn(`Failed to read ${projectFile.get_path()}: ${e}`);
+        }
+    }
+
+    htmlFile ??= dir?.get_child('index.html') ?? null;
+    if (!htmlFile?.query_exists(null))
+        return null;
+
+    return {uri: htmlFile.get_uri(), properties};
+}
 
 let extSettings: Gio.Settings | null = null;
 const extSchemaId = 'io.github.jeffshee.hanabi-extension';
@@ -136,6 +221,9 @@ const HanabiRenderer = GObject.registerClass(
         private adapter: any;
         private media: Gtk.MediaFile | null;
 
+        private webWallpaper: WebWallpaper | null;
+        private webViews: any[];
+
         private dbus: any;
         private display: Gdk.Display | null;
         private monitors: Gdk.Monitor[];
@@ -158,6 +246,8 @@ const HanabiRenderer = GObject.registerClass(
             this.play = null;
             this.adapter = null;
             this.media = null;
+            this.webWallpaper = null;
+            this.webViews = [];
             this.dbus = null;
             this.display = null;
             this.monitors = [];
@@ -337,8 +427,14 @@ const HanabiRenderer = GObject.registerClass(
         }
 
         private buildUI(): void {
+            this.webWallpaper = haveWebKit ? resolveWebWallpaper(videoPath) : null;
+            if (this.webWallpaper)
+                this.gstImplName = 'WebKitWebView';
+
             this.monitors.forEach((gdkMonitor, index) => {
-                let widget: Gtk.Widget | null = this.getWidgetFromSharedPaintable();
+                let widget: Gtk.Widget | null = this.webWallpaper
+                    ? this.getWebWidget(this.webWallpaper)
+                    : this.getWidgetFromSharedPaintable();
 
                 if (index > 0 && !widget)
                     return;
@@ -497,6 +593,79 @@ const HanabiRenderer = GObject.registerClass(
             return widget;
         }
 
+        private getWebWidget(web: WebWallpaper): Gtk.Widget {
+            const settings = new WebKit.Settings({
+                enable_webgl: true,
+                hardware_acceleration_policy: WebKit.HardwareAccelerationPolicy.ALWAYS,
+                allow_file_access_from_file_urls: true,
+                enable_developer_extras: isDebugMode,
+                enable_write_console_messages_to_stdout: isDebugMode,
+                enable_smooth_scrolling: false,
+                media_playback_requires_user_gesture: false,
+            });
+
+            const userContentManager = new WebKit.UserContentManager();
+            userContentManager.add_script(new WebKit.UserScript(
+                WEB_PAUSE_SCRIPT,
+                WebKit.UserContentInjectedFrames.TOP_FRAME,
+                WebKit.UserScriptInjectionTime.START,
+                null,
+                null
+            ));
+
+            const webView = new WebKit.WebView({
+                settings,
+                user_content_manager: userContentManager,
+                hexpand: true,
+                vexpand: true,
+                can_target: false,
+            });
+            webView.set_background_color(new Gdk.RGBA({red: 0, green: 0, blue: 0, alpha: 1}));
+            webView.set_is_muted(mute);
+
+            webView.connect('load-changed', (view: any, event: number) => {
+                if (event !== WebKit.LoadEvent.FINISHED)
+                    return;
+                const props = JSON.stringify(web.properties);
+                this.runWebScript(view,
+                    `window.wallpaperPropertyListener?.applyUserProperties?.(${props});`);
+                if (!this.playing)
+                    this.runWebScript(view, 'window.__hanabiSetPaused?.(true);');
+            });
+            webView.connect('web-process-terminated', (_view: any, reason: number) => {
+                console.error(`Web process terminated (reason ${reason}), reloading`);
+                webView.load_uri(web.uri);
+            });
+
+            webView.load_uri(web.uri);
+            this.webViews.push(webView);
+            this.setWebPlaying(true);
+
+            return webView;
+        }
+
+        private runWebScript(webView: any, script: string): void {
+            webView.evaluate_javascript(script, -1, null, null, null, (view: any, res: Gio.AsyncResult) => {
+                try {
+                    view.evaluate_javascript_finish(res);
+                } catch (e) {
+                    console.debug(`evaluate_javascript failed: ${e}`);
+                }
+            });
+        }
+
+        private setWebPlaying(playing: boolean): void {
+            this.webViews.forEach(view =>
+                this.runWebScript(view, `window.__hanabiSetPaused?.(${!playing});`));
+            if (this.playing === playing)
+                return;
+            this.playing = playing;
+            this.dbus.emit_signal(
+                'isPlayingChanged',
+                new GLib.Variant('(b)', [this.playing])
+            );
+        }
+
         private getGtkStockWidget(): Gtk.Widget {
             this.gstImplName = 'GtkMediaFile';
 
@@ -569,6 +738,7 @@ const HanabiRenderer = GObject.registerClass(
         }
 
         setMute(_mute: boolean): void {
+            this.webViews.forEach(view => view.set_is_muted(_mute));
             if (this.play) {
                 if (this.play.mute === _mute)
                     this.play.mute = !_mute;
@@ -581,6 +751,19 @@ const HanabiRenderer = GObject.registerClass(
         }
 
         setFilePath(_videoPath: string): void {
+            const web = haveWebKit ? resolveWebWallpaper(_videoPath) : null;
+            if (!!web !== !!this.webWallpaper) {
+                // Switching between video and web needs a different widget tree;
+                // exit and let the extension relaunch the renderer.
+                this.quit();
+                return;
+            }
+            if (web) {
+                this.webWallpaper = web;
+                this.webViews.forEach(view => view.load_uri(web.uri));
+                return;
+            }
+
             const file = Gio.File.new_for_path(_videoPath);
             if (this.play) {
                 this.play.set_uri(file.get_uri());
@@ -597,6 +780,8 @@ const HanabiRenderer = GObject.registerClass(
                 this.play.play();
             else if (this.media)
                 this.media.play();
+            else if (this.webViews.length > 0)
+                this.setWebPlaying(true);
         }
 
         setPause(): void {
@@ -604,6 +789,8 @@ const HanabiRenderer = GObject.registerClass(
                 this.play.pause();
             else if (this.media)
                 this.media.pause();
+            else if (this.webViews.length > 0)
+                this.setWebPlaying(false);
         }
 
         setAutoWallpaper(): void {

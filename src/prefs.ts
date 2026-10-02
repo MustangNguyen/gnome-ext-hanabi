@@ -178,6 +178,8 @@ function prefsRowVideoPath(window: PrefsWindow, prefsGroup: Adw.PreferencesGroup
     row.connect('activated', () => {
         const fileFilter = new Gtk.FileFilter();
         fileFilter.add_mime_type('video/*');
+        fileFilter.add_mime_type('text/html');
+        fileFilter.add_pattern('project.json');
 
         const dialog = new Gtk.FileDialog({title: _('Open File'), modal: true});
         dialog.set_default_filter(fileFilter);
