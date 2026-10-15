@@ -66,7 +66,7 @@ try {
     // WebKitGTK 6.0 (GTK4) is optional; only needed for web wallpapers
     // @ts-expect-error -- no @girs/webkit-6.0 types; WebKit is used untyped
     WebKit = ((await import('gi://WebKit?version=6.0')) as any).default;
-} catch (e) {
+} catch (_e) {
     console.warn('WebKit 6.0, or the typelib is not installed. Web wallpapers are disabled.');
 }
 const haveWebKit = WebKit !== null;
@@ -76,6 +76,7 @@ const useGstGL = isGstVersionAtLeast(1, 24);
 
 interface WebWallpaper {
     uri: string;
+    sharedView: boolean;
     // Wallpaper Engine style user properties: {key: {value}}
     properties: Record<string, {value: unknown}>;
 }
@@ -104,6 +105,8 @@ const WEB_PAUSE_SCRIPT = `(() => {
 /**
  * Resolves a wallpaper path to a web wallpaper, or null when it is a video.
  * Accepts an .html file, or a Wallpaper Engine folder with project.json of type "web".
+ *
+ * @param {string} path local wallpaper file or directory
  */
 function resolveWebWallpaper(path: string): WebWallpaper | null {
     if (!path)
@@ -125,7 +128,8 @@ function resolveWebWallpaper(path: string): WebWallpaper | null {
         return null;
     }
 
-    let properties: Record<string, {value: unknown}> = {};
+    let sharedView = false;
+    const properties: Record<string, {value: unknown}> = {};
     const projectFile = dir?.get_child('project.json');
     if (projectFile?.query_exists(null)) {
         try {
@@ -135,6 +139,7 @@ function resolveWebWallpaper(path: string): WebWallpaper | null {
                 return null;
             if (!htmlFile && project.file)
                 htmlFile = dir!.get_child(project.file);
+            sharedView = project.hanabi?.sharedView === true;
             for (const [key, prop] of Object.entries<any>(project.general?.properties ?? {}))
                 properties[key] = {value: prop.value};
         } catch (e) {
@@ -146,7 +151,7 @@ function resolveWebWallpaper(path: string): WebWallpaper | null {
     if (!htmlFile?.query_exists(null))
         return null;
 
-    return {uri: htmlFile.get_uri(), properties};
+    return {uri: htmlFile.get_uri(), properties, sharedView};
 }
 
 let extSettings: Gio.Settings | null = null;
@@ -432,9 +437,20 @@ const HanabiRenderer = GObject.registerClass(
                 this.gstImplName = 'WebKitWebView';
 
             this.monitors.forEach((gdkMonitor, index) => {
-                let widget: Gtk.Widget | null = this.webWallpaper
-                    ? this.getWebWidget(this.webWallpaper)
-                    : this.getWidgetFromSharedPaintable();
+                let widget: Gtk.Widget | null;
+                if (this.webWallpaper?.sharedView) {
+                    // Opt-in mirroring avoids a second WebGL simulation and context.
+                    if (index === 0) {
+                        widget = this.getWebWidget(this.webWallpaper);
+                        this.sharedPaintable = new Gtk.WidgetPaintable({widget});
+                    } else {
+                        widget = this.getWidgetFromSharedPaintable();
+                    }
+                } else {
+                    widget = this.webWallpaper
+                        ? this.getWebWidget(this.webWallpaper)
+                        : this.getWidgetFromSharedPaintable();
+                }
 
                 if (index > 0 && !widget)
                     return;
@@ -702,6 +718,12 @@ const HanabiRenderer = GObject.registerClass(
                 <interface name="${APPLICATION_ID}">
                     <method name="setPlay"/>
                     <method name="setPause"/>
+                    <method name="setPointer">
+                        <arg name="monitor" type="i" direction="in"/>
+                        <arg name="x" type="d" direction="in"/>
+                        <arg name="y" type="d" direction="in"/>
+                        <arg name="active" type="b" direction="in"/>
+                    </method>
                     <property name="isPlaying" type="b" access="read"/>
                     <signal name="isPlayingChanged">
                         <arg name="isPlaying" type="b"/>
@@ -752,7 +774,7 @@ const HanabiRenderer = GObject.registerClass(
 
         setFilePath(_videoPath: string): void {
             const web = haveWebKit ? resolveWebWallpaper(_videoPath) : null;
-            if (!!web !== !!this.webWallpaper) {
+            if (!!web !== !!this.webWallpaper || web?.sharedView !== this.webWallpaper?.sharedView) {
                 // Switching between video and web needs a different widget tree;
                 // exit and let the extension relaunch the renderer.
                 this.quit();
@@ -791,6 +813,17 @@ const HanabiRenderer = GObject.registerClass(
                 this.media.pause();
             else if (this.webViews.length > 0)
                 this.setWebPlaying(false);
+        }
+
+        setPointer(_monitor: number, _x: number, _y: number, _active: boolean): void {
+            this.webViews.forEach((view, index) => {
+                const payload = JSON.stringify({
+                    x: _x,
+                    y: _y,
+                    active: _active && (this.webWallpaper?.sharedView || index === _monitor),
+                });
+                this.runWebScript(view, `window.wallpaperPointerListener?.(${payload});`);
+            });
         }
 
         setAutoWallpaper(): void {

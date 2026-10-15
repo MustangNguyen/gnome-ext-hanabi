@@ -27,6 +27,7 @@ import {PlaybackState} from './playbackState.js';
 import {AutoPause} from './autoPause.js';
 import {HanabiPanelMenu} from './panelMenu.js';
 import {Logger} from './logger.js';
+import {RendererWrapper} from './dbus.js';
 
 const logger = new Logger('extension');
 
@@ -35,6 +36,7 @@ const RENDERER_RELOAD_DELAY_MS = 100;
 const RENDERER_RELOAD_DELAY_ON_ERROR_MS = 1000;
 // Debounce for coalescing rapid monitors-changed events (ms).
 const MONITORS_CHANGED_DEBOUNCE_MS = 500;
+const POINTER_UPDATE_INTERVAL_MS = 33;
 
 // An emitter paired with a signal handler id, disconnected together in disable().
 type SignalConnection = [emitter: { disconnect(id: number): void }, id: number];
@@ -49,6 +51,7 @@ export default class HanabiExtension extends Extension {
     private shellOverride: GnomeShellOverride | null = null;
     private windowManager: WindowManager | null = null;
     private autoPause: AutoPause | null = null;
+    private pointerRenderer: RendererWrapper | null = null;
 
     // Renderer subprocess and its relaunch timeout.
     private currentProcess: WaylandSubprocess | null = null;
@@ -59,6 +62,8 @@ export default class HanabiExtension extends Extension {
     // Signal connections and the monitors-changed timeout, cleaned up in disable().
     private signalConnections: SignalConnection[] = [];
     private monitorsChangedTimeoutId = 0;
+    private pointerTimeoutId = 0;
+    private pointerUpdatePending = false;
 
     getPlaybackState(): PlaybackState {
         return this.playbackState!;
@@ -124,6 +129,7 @@ export default class HanabiExtension extends Extension {
         this.shellOverride!.enable();
         this.windowManager!.enable();
         this.autoPause!.enable();
+        this.startPointerForwarding();
 
         const monitorsChangedId = Main.layoutManager.connect(
             'monitors-changed',
@@ -176,6 +182,7 @@ export default class HanabiExtension extends Extension {
             return;
         logger.debug('Suspending renderer (lock screen)');
         this.rendererSuspended = true;
+        this.stopPointerForwarding();
         if (this.launchRendererTimeoutId) {
             GLib.source_remove(this.launchRendererTimeoutId);
             this.launchRendererTimeoutId = 0;
@@ -189,6 +196,7 @@ export default class HanabiExtension extends Extension {
             return;
         logger.debug('Resuming renderer');
         this.rendererSuspended = false;
+        this.startPointerForwarding();
         if (this.isEnabled && !this.currentProcess)
             this.launchRenderer();
     }
@@ -251,6 +259,7 @@ export default class HanabiExtension extends Extension {
     disable(): void {
         logger.debug('Disabling');
 
+        this.stopPointerForwarding();
         this.killCurrentProcess();
         this.rendererSuspended = false;
 
@@ -269,6 +278,51 @@ export default class HanabiExtension extends Extension {
         }
 
         this.isEnabled = false;
+    }
+
+    private startPointerForwarding(): void {
+        if (this.pointerTimeoutId)
+            return;
+
+        this.pointerRenderer = new RendererWrapper();
+        this.forwardPointer();
+        this.pointerTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            POINTER_UPDATE_INTERVAL_MS,
+            () => {
+                this.forwardPointer();
+                return GLib.SOURCE_CONTINUE;
+            }
+        );
+    }
+
+    private stopPointerForwarding(): void {
+        if (this.pointerTimeoutId) {
+            GLib.source_remove(this.pointerTimeoutId);
+            this.pointerTimeoutId = 0;
+        }
+        this.pointerRenderer = null;
+        this.pointerUpdatePending = false;
+    }
+
+    private forwardPointer(): void {
+        if (!this.pointerRenderer || this.pointerUpdatePending)
+            return;
+
+        const [pointerX, pointerY] = global.get_pointer();
+        const monitorIndex = Main.layoutManager.monitors.findIndex(monitor =>
+            pointerX >= monitor.x && pointerX < monitor.x + monitor.width &&
+            pointerY >= monitor.y && pointerY < monitor.y + monitor.height
+        );
+        const monitor = Main.layoutManager.monitors[monitorIndex];
+        const active = monitor !== undefined;
+        const x = active ? Math.min(Math.max((pointerX - monitor.x) / monitor.width, 0), 1) : 0;
+        const y = active ? Math.min(Math.max((pointerY - monitor.y) / monitor.height, 0), 1) : 0;
+
+        this.pointerUpdatePending = true;
+        void this.pointerRenderer.setPointer(monitorIndex, x, y, active).finally(() => {
+            this.pointerUpdatePending = false;
+        });
     }
 
     private killCurrentProcess(): void {

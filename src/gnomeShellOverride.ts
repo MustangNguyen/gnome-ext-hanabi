@@ -221,18 +221,9 @@ export class GnomeShellOverride {
         // exclude the renderer from the app tracker.
         // -----------------------------------------------------------------
 
-        this.injectionManager.overrideMethod(
-            Shell.WindowTracker.prototype,
-            'get_window_app',
-            originalMethod => {
-                return function (this: Shell.WindowTracker, window: Meta.Window) {
-                    const isRenderer = window.title?.includes(APPLICATION_ID);
-                    // null! is a type lie: InjectionManager's strict return type requires
-                    // App, but we intentionally return null for renderer windows.
-                    return isRenderer ? null! : originalMethod.apply(this, [window]);
-                };
-            }
-        );
+        // Keep get_window_app intact: GNOME 50's WindowPreview requires an App
+        // while a renderer is moving between monitors. Filter public window/app
+        // lists below instead of returning null during that transition.
 
         this.injectionManager.overrideMethod(
             Shell.App.prototype,

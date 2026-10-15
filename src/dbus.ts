@@ -32,6 +32,7 @@ type DBusSignalProxy = Gio.DBusProxy & {
 interface RendererProxy extends DBusSignalProxy {
     setPlayAsync(): Promise<void>;
     setPauseAsync(): Promise<void>;
+    setPointerAsync(monitor: number, x: number, y: number, active: boolean): Promise<void>;
 }
 
 // Ref: https://gjs.guide/guides/gio/dbus.html#high-level-proxies
@@ -50,6 +51,12 @@ export class RendererWrapper {
             <interface name="${APPLICATION_ID}">
                 <method name="setPlay"/>
                 <method name="setPause"/>
+                <method name="setPointer">
+                    <arg name="monitor" type="i" direction="in"/>
+                    <arg name="x" type="d" direction="in"/>
+                    <arg name="y" type="d" direction="in"/>
+                    <arg name="active" type="b" direction="in"/>
+                </method>
                 <property name="isPlaying" type="b" access="read"/>
                 <signal name="isPlayingChanged">
                     <arg name="isPlaying" type="b"/>
@@ -73,6 +80,14 @@ export class RendererWrapper {
             await this.proxy.setPauseAsync();
         } catch (e) {
             this.logger.warn(e);
+        }
+    }
+
+    async setPointer(monitor: number, x: number, y: number, active: boolean): Promise<void> {
+        try {
+            await this.proxy.setPointerAsync(monitor, x, y, active);
+        } catch {
+            // The renderer may be between launches. The next sample will retry.
         }
     }
 }
